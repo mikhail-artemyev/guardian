@@ -96,7 +96,14 @@ export class RoleService extends NatsService {
      * @private
      */
     public replySubject = 'auth-roles-queue-reply-' + GenerateUUIDv4();
+    constructor() {
+        super();
 
+        this.configureACL(
+            Object.values(AuthEvents),
+            Object.values(AuthEvents),
+        )
+    }
     /**
      * Register listeners
      */

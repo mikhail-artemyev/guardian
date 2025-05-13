@@ -20,6 +20,7 @@ import {
     UserRole
 } from '@guardian/interfaces';
 import { UserUtils, UserPassword, PasswordType, UserAccessTokenService, UserProp } from '#utils';
+import { ForbiddenException } from '@nestjs/common';
 
 /**
  * Account service
@@ -37,6 +38,15 @@ export class AccountService extends NatsService {
      * @private
      */
     public replySubject = 'auth-users-queue-reply-' + GenerateUUIDv4();
+
+    constructor() {
+        super();
+
+        this.configureACL(
+            Object.values(AuthEvents),
+            Object.values(AuthEvents),
+        )
+    }
 
     /**
      * Register listeners

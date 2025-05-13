@@ -11,7 +11,14 @@ export class AISuggestionsService extends NatsService {
      * Message queue name
      */
     public messageQueueName = 'ai-suggestions-guardian';
+    constructor() {
+        super();
 
+        this.configureACL(
+            Object.values(MessageAPI),
+            Object.values(MessageAPI),
+        )
+    }
     /**
      * Reply subject
      * @private

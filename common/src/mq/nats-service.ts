@@ -2,6 +2,8 @@ import { NatsConnection, headers, Subscription } from 'nats';
 import { GenerateUUIDv4 } from '@guardian/interfaces';
 import { ZipCodec } from './zip-codec.js';
 import { IMessageResponse } from '../models/index.js';
+import { ForbiddenException } from '@nestjs/common';
+import { JwtHmacValidator } from '../security/jwt-hmac-validator.js';
 
 type CallbackFunction = (body: any, error?: string, code?: number) => void;
 
@@ -42,10 +44,24 @@ export abstract class NatsService {
      * responseCallbacksMap
      */
     protected responseCallbacksMap: Map<string, CallbackFunction> = new Map();
+    private publishAllowed: string[] | null = null;
+    private subscribeAllowed: string[] | null = null;
 
     constructor() {
         this.codec = ZipCodec();
         // this.codec = JSONCodec();
+    }
+
+    /**
+     * Set configure
+     */
+    public configureACL(
+        publishList: string[],
+        subscribeList: string[],
+    ): void {
+        // if (!publishList.length) throw new Error('publishList must not be empty');
+        this.publishAllowed = publishList;
+        this.subscribeAllowed = subscribeList;
     }
 
     /**
@@ -59,13 +75,20 @@ export abstract class NatsService {
             callback: async (error, msg) => {
                 if (!error) {
                     const messageId = msg.headers.get('messageId');
+                    const serviceToken = msg.headers.get('serviceToken');
                     const fn = this.responseCallbacksMap.get(messageId);
                     if (fn) {
                         const message = (await this.codec.decode(msg.data)) as IMessageResponse<any>;
                         if (!message) {
                             fn(null)
                         } else {
-                            fn(message.body, message.error, message.code);
+                            try {
+                                const data = JwtHmacValidator.validateAndUnwrap({data: message, token: serviceToken});
+                                fn(message.body, message.error, message.code);
+                            } catch (e: any) {
+                                console.error('Reply validation failed:', e.message);
+                                fn(null, e.message, 401);
+                            }
                         }
                         this.responseCallbacksMap.delete(messageId)
                     }
@@ -92,7 +115,14 @@ export abstract class NatsService {
      * @param replySubject
      */
     public async publish(subject: string, data?: unknown, replySubject?: string): Promise<void> {
-        const opts: any = {};
+        if (this.publishAllowed && !this.publishAllowed) throw new Error('Publish ACL not configured');
+        if (this.publishAllowed && !this.publishAllowed.includes(subject)) {
+            throw new Error(`Publish to "${subject}" not allowed`);
+        }
+        const { token } = JwtHmacValidator.wrapEnvelope(data);
+        const opts: any = {
+            serviceToken: token
+        };
 
         if (replySubject) {
             opts.reply = replySubject;
@@ -107,12 +137,18 @@ export abstract class NatsService {
      * @param cb
      */
     public subscribe(subject: string, cb: Function): Subscription {
+        if (this.subscribeAllowed && !this.subscribeAllowed.includes(subject)) {
+            throw new Error(`NATS ACL: subscription to "${subject}" not allowed`);
+        }
         const sub = this.connection.subscribe(subject);
 
         const fn = async (_sub: Subscription) => {
             for await (const m of _sub) {
                 try {
-                    cb(await this.codec.decode(m.data));
+                    const serviceToken = m.headers.get('serviceToken')
+                    const data = await this.codec.decode(m.data);
+                    const { token } = JwtHmacValidator.validateAndUnwrap({data, token: serviceToken});
+                    cb(data);
                 } catch (e) {
                     console.error(e.message);
                 }
@@ -130,6 +166,11 @@ export abstract class NatsService {
      * @param externalMessageId
      */
     public sendMessage<T>(subject: string, data?: unknown, isResponseCallback: boolean = true, externalMessageId?: string): Promise<T> {
+        if (this.publishAllowed && !this.publishAllowed) throw new Error('Publish ACL not configured');
+        if (this.publishAllowed && !this.publishAllowed.includes(subject)) {
+            throw new Error(`Publish to "${subject}" not allowed`);
+        }
+
         const messageId = externalMessageId ?? GenerateUUIDv4();
 
         return new Promise(async (resolve, reject) => {
@@ -146,6 +187,9 @@ export abstract class NatsService {
             } else {
                 resolve(null);
             }
+
+            const { token } = JwtHmacValidator.wrapEnvelope(data);
+            head.append('serviceToken', token);
 
             this.connection.publish(subject, await this.codec.encode(data), {
                 reply: this.replySubject,
@@ -181,6 +225,10 @@ export abstract class NatsService {
      * @param data
      */
     public sendRawMessage<T>(subject: string, data?: unknown): Promise<T> {
+        if (this.publishAllowed && !this.publishAllowed) throw new Error('Publish ACL not configured');
+        if (this.publishAllowed && !this.publishAllowed.includes(subject)) {
+            throw new Error(`Publish to "${subject}" not allowed`);
+        }
         const messageId = GenerateUUIDv4();
         return new Promise(async (resolve, reject) => {
             const head = headers();
@@ -194,6 +242,9 @@ export abstract class NatsService {
                     resolve(body);
                 }
             })
+
+            const { token } = JwtHmacValidator.wrapEnvelope(data);
+            head.append('serviceToken', token);
 
             this.connection.publish(subject, await this.codec.encode(data), {
                 reply: this.replySubject,
@@ -214,12 +265,30 @@ export abstract class NatsService {
             callback: async (error, msg) => {
                 try {
                     const messageId = msg.headers?.get('messageId');
+                    const serviceToken = msg.headers?.get('serviceToken');
                     // const isRaw = msg.headers.get('rawMessage');
                     const head = headers();
                     if (messageId) {
                         head.append('messageId', messageId);
                     }
                     // head.append('rawMessage', isRaw);
+                    if (this.subscribeAllowed && !this.subscribeAllowed.includes(subject)) {
+                        if (!noRespond) {
+                            return msg.respond(await this.codec.encode({
+                                body: null,
+                                error: 'Forbidden',
+                                code: 403,
+                                name: 'Forbidden',
+                                message: 'Forbidden'
+                              }), { headers: head });
+                        } else {
+                            throw new ForbiddenException();
+                        }
+                    }
+
+                    const data = await this.codec.decode(msg.data);
+                    const { token } = JwtHmacValidator.validateAndUnwrap({data, token: serviceToken});
+
                     if (!noRespond) {
                         msg.respond(await this.codec.encode(await cb(await this.codec.decode(msg.data), msg.headers)), { headers: head });
                     } else {
